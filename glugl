@@ -1,0 +1,166 @@
+#!/usr/bin/env python3
+import argparse
+import json
+import os
+import subprocess
+from datetime import datetime
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="glugl: aplica metadata de Google Takeout (.json) a fotos y vídeos."
+    )
+    parser.add_argument(
+        "-d", "--directory",
+        default=".",
+        help="Directorio raíz sobre el que actuar (por defecto, el directorio actual)."
+    )
+    parser.add_argument(
+        "-r", "--recursive",
+        action="store_true",
+        help="Recorrer subdirectorios de forma recursiva."
+    )
+    parser.add_argument(
+        "-L", "--max-depth",
+        type=int,
+        default=None,
+        help="Profundidad máxima al recorrer recursivamente (como tree)."
+    )
+    parser.add_argument(
+        "-n", "--dry-run",
+        action="store_true",
+        help="No modificar nada, solo mostrar lo que se haría."
+    )
+    parser.add_argument(
+        "-v", "--verbose",
+        action="store_true",
+        help="Mostrar información detallada de lo que se va haciendo."
+    )
+    return parser.parse_args()
+
+def iter_dirs(root, recursive, max_depth):
+    root = os.path.abspath(root)
+    if not recursive:
+        yield root
+        return
+
+    for current_dir, dirnames, filenames in os.walk(root):
+        rel = os.path.relpath(current_dir, root)
+        if rel == ".":
+            depth = 0
+        else:
+            # cada separación de path cuenta como un nivel
+            depth = rel.count(os.sep) + 1
+
+        if max_depth is not None and depth > max_depth:
+            # podar más profundo
+            dirnames[:] = []
+            continue
+
+        yield current_dir
+
+def apply_metadata_from_json(media_path, json_path, dry_run=False, verbose=False):
+    # Versión mínima: solo fecha y favorito
+    with open(json_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    exiftool_args = []
+
+    # Fecha de captura
+    ts = None
+    if isinstance(data.get("photoTakenTime"), dict):
+        ts = data["photoTakenTime"].get("timestamp")
+
+    if ts:
+        try:
+            dt = datetime.fromtimestamp(int(ts))
+            dt_str = dt.strftime("%Y:%m:%d %H:%M:%S")
+            # Para fotos: DateTimeOriginal, CreateDate
+            # Para vídeo: QuickTime:CreateDate, QuickTime:ModifyDate, etc.
+            # Aquí lo simplificamos un poco:
+            exiftool_args.extend([
+                f"-DateTimeOriginal={dt_str}",
+                f"-CreateDate={dt_str}",
+            ])
+        except Exception as e:
+            if verbose:
+                print(f"[WARN] No se pudo interpretar timestamp '{ts}' en {json_path}: {e}")
+
+    # Favorito
+    is_fav = data.get("isFavorite")
+    if is_fav:
+        # Convención: rating 5 para favoritos
+        exiftool_args.append("-Rating=5")
+
+    if not exiftool_args:
+        if verbose:
+            print(f"[INFO] No hay metadata que aplicar desde {json_path}")
+        return
+
+    cmd = ["exiftool", "-overwrite_original"]
+    cmd.extend(exiftool_args)
+    cmd.append(media_path)
+
+    if verbose:
+        print("[CMD]", " ".join(cmd))
+
+    if not dry_run:
+        subprocess.run(cmd, check=False)
+
+def process_directory(directory, dry_run=False, verbose=False):
+    directory = os.path.abspath(directory)
+    if verbose:
+        print(f"\n[DIR] Procesando {directory}")
+
+    try:
+        entries = os.listdir(directory)
+    except OSError as e:
+        print(f"[ERROR] No se puede listar {directory}: {e}")
+        return
+
+    files = [f for f in entries if os.path.isfile(os.path.join(directory, f))]
+    json_dir = os.path.join(directory, "glugl_metadata")
+    media_to_json = []
+
+    # Buscar parejas media ↔ json
+    for f in files:
+        if f.endswith(".json"):
+            continue
+        media_path = os.path.join(directory, f)
+        json_name = f + ".json"
+        json_path = os.path.join(directory, json_name)
+        if os.path.exists(json_path):
+            media_to_json.append((media_path, json_path))
+
+    if not media_to_json and verbose:
+        print("[INFO] No se encontraron parejas media/json aquí.")
+        return
+
+    # Crear carpeta glugl_metadata si hay algo que mover
+    if media_to_json and not dry_run and not os.path.exists(json_dir):
+        os.mkdir(json_dir)
+        if verbose:
+            print(f"[INFO] Creada carpeta {json_dir}")
+
+    # Procesar
+    for media_path, json_path in media_to_json:
+        if verbose:
+            print(f"[PAIR] {os.path.basename(media_path)}  <->  {os.path.basename(json_path)}")
+
+        apply_metadata_from_json(media_path, json_path, dry_run=dry_run, verbose=verbose)
+
+        # Mover json
+        dest_json = os.path.join(json_dir, os.path.basename(json_path))
+        if verbose:
+            print(f"[MOVE] {json_path} -> {dest_json}")
+        if not dry_run:
+            os.replace(json_path, dest_json)
+
+def main():
+    args = parse_args()
+    root = args.directory
+
+    for d in iter_dirs(root, args.recursive, args.max_depth):
+        process_directory(d, dry_run=args.dry_run, verbose=args.verbose)
+
+if __name__ == "__main__":
+    main()
